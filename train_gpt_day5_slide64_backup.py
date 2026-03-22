@@ -75,7 +75,6 @@ class Hyperparameters:
     # Eval hyperparameters.
     eval_stride = int(os.environ.get("EVAL_STRIDE", "0"))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", "256"))
-    eval_doc_isolated = bool(int(os.environ.get("EVAL_DOC_ISOLATED", "0")))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -217,14 +216,13 @@ def build_sentencepiece_luts(
         torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
     )
 
-def load_validation_tokens_full(pattern: str) -> Tensor:
+
+def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
-    return torch.cat([load_data_shard(file) for file in files]).contiguous()
-
-def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
-    tokens = load_validation_tokens_full(pattern)
+    # The export pipeline writes the fixed first-50k-doc validation set to fineweb_val_*.
+    tokens = torch.cat([load_data_shard(file) for file in files]).contiguous()
     usable = ((tokens.numel() - 1) // seq_len) * seq_len
     if usable <= 0:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
@@ -444,150 +442,6 @@ def eval_val_sliding(
     base_model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
-def eval_val_doc_isolated(
-    args: Hyperparameters,
-    base_model: GPT,
-    rank: int,
-    world_size: int,
-    device: torch.device,
-    base_bytes_lut: Tensor,
-    has_leading_space_lut: Tensor,
-    is_boundary_token_lut: Tensor,
-) -> tuple[float, float]:
-    """
-    Evaluate on each validation document independently.
-
-    - If EVAL_STRIDE == 0: use flat doc-isolated windows
-    - If EVAL_STRIDE > 0: use sliding doc-isolated windows
-    """
-    all_tokens = load_validation_tokens_full(args.val_files)
-    docs = _find_docs(all_tokens)  # reuse same BOS-based document logic as TTT
-    rank_docs = docs[(len(docs) * rank) // world_size : (len(docs) * (rank + 1)) // world_size]
-
-    seq_len = args.train_seq_len
-    stride = args.eval_stride if args.eval_stride > 0 else seq_len
-    batch_seqs = max(1, args.eval_batch_seqs)
-
-    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
-    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
-    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
-
-    base_model.eval()
-
-    def accumulate_slice(losses_row: Tensor, x_row: Tensor, y_row: Tensor, lo: int, hi: int) -> None:
-        nonlocal val_loss_sum, val_token_count, val_byte_count
-        lbl = losses_row[lo:hi].to(torch.float64)
-        prev_ids = x_row[lo:hi]
-        tgt_ids = y_row[lo:hi]
-
-        token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-        token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
-
-        val_loss_sum += lbl.sum()
-        val_token_count += float(hi - lo)
-        val_byte_count += token_bytes.to(torch.float64).sum()
-
-    def score_single_window(local_tokens: Tensor, lo: int, hi: int) -> None:
-        x = local_tokens[:-1].unsqueeze(0)
-        y = local_tokens[1:].unsqueeze(0)
-
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-            logits = base_model.forward_logits(x)
-
-        losses = F.cross_entropy(
-            logits.float().reshape(-1, logits.size(-1)),
-            y.reshape(-1),
-            reduction="none",
-        ).reshape_as(y)
-
-        accumulate_slice(losses[0], x[0], y[0], lo, hi)
-
-    def flush_batch(batch_x: list[Tensor], batch_y: list[Tensor], batch_meta: list[tuple[int, int]]) -> None:
-        if not batch_x:
-            return
-
-        x = torch.stack(batch_x, dim=0)
-        y = torch.stack(batch_y, dim=0)
-
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-            logits = base_model.forward_logits(x)
-
-        losses = F.cross_entropy(
-            logits.float().reshape(-1, logits.size(-1)),
-            y.reshape(-1),
-            reduction="none",
-        ).reshape_as(y)
-
-        for bi, (lo, hi) in enumerate(batch_meta):
-            accumulate_slice(losses[bi], x[bi], y[bi], lo, hi)
-
-    with torch.inference_mode():
-        batch_x: list[Tensor] = []
-        batch_y: list[Tensor] = []
-        batch_meta: list[tuple[int, int]] = []
-
-        for doc_start, doc_len in rank_docs:
-            pred_len = doc_len - 1
-            if pred_len <= 0:
-                continue
-
-            # Score the prefix once. These early tokens can't have full context anyway.
-            p = 0
-            q = min(pred_len, seq_len)
-            prefix = all_tokens[doc_start : doc_start + q + 1].to(
-                device=device, dtype=torch.int64, non_blocking=True
-            )
-            score_single_window(prefix, 0, q)
-            p = q
-
-            # Then score the rest with either flat doc windows (stride=seq_len)
-            # or sliding doc windows (stride < seq_len).
-            while p < pred_len:
-                q = min(p + stride, pred_len)
-                window_end = q
-                window_start = max(0, window_end - seq_len)
-
-                local = all_tokens[doc_start + window_start : doc_start + window_end + 1].to(
-                    device=device, dtype=torch.int64, non_blocking=True
-                )
-
-                lo = p - window_start
-                hi = q - window_start
-
-                if local.numel() != seq_len + 1:
-                    flush_batch(batch_x, batch_y, batch_meta)
-                    batch_x.clear()
-                    batch_y.clear()
-                    batch_meta.clear()
-                    score_single_window(local, lo, hi)
-                    p = q
-                    continue
-
-                batch_x.append(local[:-1])
-                batch_y.append(local[1:])
-                batch_meta.append((lo, hi))
-
-                if len(batch_x) >= batch_seqs:
-                    flush_batch(batch_x, batch_y, batch_meta)
-                    batch_x.clear()
-                    batch_y.clear()
-                    batch_meta.clear()
-
-                p = q
-
-        flush_batch(batch_x, batch_y, batch_meta)
-
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
-        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
-
-    val_loss = val_loss_sum / val_token_count
-    bits_per_token = val_loss.item() / math.log(2.0)
-    tokens_per_byte = val_token_count.item() / val_byte_count.item()
-    base_model.train()
-    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
-
 def run_eval(
     args: Hyperparameters,
     model: nn.Module,
@@ -601,17 +455,6 @@ def run_eval(
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
 ) -> tuple[float, float]:
-    if args.eval_doc_isolated:
-        return eval_val_doc_isolated(
-            args,
-            base_model,
-            rank,
-            world_size,
-            device,
-            base_bytes_lut,
-            has_leading_space_lut,
-            is_boundary_token_lut,
-        )
     if args.eval_stride > 0:
         return eval_val_sliding(
             args,
@@ -1510,12 +1353,7 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    log0(
-        f"eval_doc_isolated:{args.eval_doc_isolated} "
-        f"eval_mode:{'sliding' if args.eval_stride > 0 else 'flat'} "
-        f"eval_stride:{args.eval_stride} "
-        f"eval_batch_seqs:{args.eval_batch_seqs}"
-    )
+    log0(f"eval_mode:{'sliding' if args.eval_stride > 0 else 'flat'} eval_stride:{args.eval_stride} eval_batch_seqs:{args.eval_batch_seqs}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
