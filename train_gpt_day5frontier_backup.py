@@ -92,10 +92,6 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
-    muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.0))
-    scalar_weight_decay = float(os.environ.get("SCALAR_WEIGHT_DECAY", 0.0))
-    head_weight_decay = float(os.environ.get("HEAD_WEIGHT_DECAY", 0.0))
-
     # Test-time training (LoRA) hyperparameters.
     ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 8))
     ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.01))
@@ -1331,7 +1327,6 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-    optimizer_head = None
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
@@ -1360,11 +1355,6 @@ def main() -> None:
     log0(f"seed:{args.seed}")
     log0(f"eval_mode:{'sliding' if args.eval_stride > 0 else 'flat'} eval_stride:{args.eval_stride} eval_batch_seqs:{args.eval_batch_seqs}")
 
-    log0(
-        f"muon_weight_decay:{args.muon_weight_decay} "
-        f"scalar_weight_decay:{args.scalar_weight_decay} "
-        f"head_weight_decay:{args.head_weight_decay}"
-    )
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
@@ -1374,29 +1364,6 @@ def main() -> None:
     def zero_grad_all() -> None:
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
-
-    
-    @torch.no_grad()
-    def apply_decoupled_weight_decay(
-        optimizer: torch.optim.Optimizer | None,
-        weight_decay: float,
-    ) -> None:
-        if optimizer is None or weight_decay <= 0:
-            return
-        for group in optimizer.param_groups:
-            lr = float(group["lr"])
-            if lr <= 0:
-                continue
-            shrink = max(1.0 - lr * weight_decay, 0.0)
-            for p in group["params"]:
-                if p.grad is not None:
-                    p.mul_(shrink)
-
-    def apply_weight_decay_all() -> None:
-        apply_decoupled_weight_decay(optimizer_muon, args.muon_weight_decay)
-        apply_decoupled_weight_decay(optimizer_scalar, args.scalar_weight_decay)
-        apply_decoupled_weight_decay(optimizer_head, args.head_weight_decay)
-            
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
@@ -1426,7 +1393,6 @@ def main() -> None:
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
-            apply_weight_decay_all()
             for opt in optimizers:
                 opt.step()
             zero_grad_all()
@@ -1510,7 +1476,6 @@ def main() -> None:
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
-        apply_weight_decay_all()
         for opt in optimizers:
             opt.step()
         zero_grad_all()
